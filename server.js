@@ -1,130 +1,59 @@
-import 'dotenv/config';
-import express from 'express';
-import cors from 'cors';
-import helmet from 'helmet';
-import bcrypt from 'bcryptjs';
-import jwt from 'jsonwebtoken';
-import pkg from 'pg';
-const { Pool } = pkg;
+// ... keep your existing imports and setup
 
-const app = express();
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false }
-});
-const PORT = process.env.PORT || 8080;
-const ORIGIN = process.env.CORS_ORIGIN || '*';
-const JWT_SECRET = process.env.JWT_SECRET || 'dev_secret';
+// === DB MIGRATION (no terminal needed) ===
+async function migrate() {
+  // CREATE EXTENSION may need superuser on some hosts; it's allowed on Render PG.
+  await sql(`CREATE EXTENSION IF NOT EXISTS "pgcrypto";`);
 
-app.use(helmet());
-app.use(express.json());
-app.use(cors({ origin: ORIGIN, credentials: true }));
-
-const sql = (text, params = []) => pool.query(text, params);
-
-function signToken(family) {
-  return jwt.sign({ fid: family.id, email: family.email }, JWT_SECRET, { expiresIn: '7d' });
-}
-
-function requireAuth(req, res, next) {
-  const h = req.headers.authorization || '';
-  const token = h.startsWith('Bearer ') ? h.slice(7) : null;
-  if (!token) return res.status(401).json({ error: 'missing token' });
-  try {
-    req.user = jwt.verify(token, JWT_SECRET);
-    next();
-  } catch {
-    return res.status(401).json({ error: 'invalid token' });
-  }
-}
-
-app.get('/health', (_, res) => res.json({ ok: true }));
-
-// AUTH
-app.post('/auth/register', async (req, res) => {
-  const { email, password } = req.body || {};
-  if (!email || !password) return res.status(400).json({ error: 'email & password required' });
-  const hash = await bcrypt.hash(password, 10);
-  try {
-    const { rows } = await sql(
-      `insert into families(email, password_hash) values($1,$2) returning id,email`,
-      [email.toLowerCase(), hash]
+  await sql(`
+    CREATE TABLE IF NOT EXISTS families (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      email TEXT UNIQUE NOT NULL,
+      password_hash TEXT NOT NULL,
+      created_at TIMESTAMPTZ DEFAULT now()
     );
-    return res.json({ token: signToken(rows[0]) });
-  } catch {
-    return res.status(400).json({ error: 'email exists?' });
-  }
-});
+  `);
 
-app.post('/auth/login', async (req, res) => {
-  const { email, password } = req.body || {};
-  const { rows } = await sql(`select id,email,password_hash from families where email=$1`, [email?.toLowerCase()]);
-  if (!rows[0]) return res.status(401).json({ error: 'invalid credentials' });
-  const ok = await bcrypt.compare(password, rows[0].password_hash);
-  if (!ok) return res.status(401).json({ error: 'invalid credentials' });
-  return res.json({ token: signToken(rows[0]) });
-});
+  await sql(`
+    CREATE TABLE IF NOT EXISTS children (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      family_id UUID REFERENCES families(id) ON DELETE CASCADE,
+      name TEXT NOT NULL,
+      yob INT,
+      created_at TIMESTAMPTZ DEFAULT now()
+    );
+  `);
 
-// CHILDREN
-app.post('/children', requireAuth, async (req, res) => {
-  const { name, yob } = req.body || {};
-  const { rows } = await sql(
-    `insert into children(family_id,name,yob) values($1,$2,$3) returning id,name,yob`,
-    [req.user.fid, name, yob || null]
-  );
-  res.json(rows[0]);
-});
+  await sql(`
+    CREATE TABLE IF NOT EXISTS rules (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      family_id UUID REFERENCES families(id) ON DELETE CASCADE,
+      platform TEXT NOT NULL,
+      daily_minutes INT NOT NULL,
+      bedtime TEXT NOT NULL,
+      whitelist JSONB DEFAULT '[]',
+      created_at TIMESTAMPTZ DEFAULT now(),
+      updated_at TIMESTAMPTZ DEFAULT now()
+    );
+  `);
 
-app.get('/children', requireAuth, async (req, res) => {
-  const { rows } = await sql(`select id,name,yob from children where family_id=$1 order by created_at`, [req.user.fid]);
-  res.json(rows);
-});
+  await sql(`
+    CREATE TABLE IF NOT EXISTS usage_events (
+      id BIGSERIAL PRIMARY KEY,
+      family_id UUID REFERENCES families(id) ON DELETE CASCADE,
+      child_id UUID REFERENCES children(id) ON DELETE SET NULL,
+      platform TEXT NOT NULL,
+      kind TEXT NOT NULL,
+      payload JSONB DEFAULT '{}'::jsonb,
+      created_at TIMESTAMPTZ DEFAULT now()
+    );
+  `);
 
-// RULES
-app.get('/rules', requireAuth, async (req, res) => {
-  const { rows } = await sql(
-    `select id,platform,daily_minutes,bedtime,whitelist,updated_at from rules where family_id=$1`,
-    [req.user.fid]
-  );
-  res.json(rows);
-});
+  console.log("✅ Database migrated");
+}
 
-app.post('/rules', requireAuth, async (req, res) => {
-  const { platform, daily_minutes, bedtime, whitelist } = req.body || {};
-  const { rows } = await sql(
-    `insert into rules(family_id,platform,daily_minutes,bedtime,whitelist) 
-     values($1,$2,$3,$4,$5) 
-     on conflict do nothing returning id,platform,daily_minutes,bedtime,whitelist`,
-    [req.user.fid, platform, daily_minutes, bedtime, JSON.stringify(whitelist || [])]
-  );
-  if (rows[0]) return res.json(rows[0]);
-  const up = await sql(
-    `update rules set daily_minutes=$3, bedtime=$4, whitelist=$5, updated_at=now()
-     where family_id=$1 and platform=$2
-     returning id,platform,daily_minutes,bedtime,whitelist`,
-    [req.user.fid, platform, daily_minutes, bedtime, JSON.stringify(whitelist || [])]
-  );
-  res.json(up.rows[0]);
+// call migration before starting the server
+migrate().catch(err => {
+  console.error("DB migration failed:", err?.message || err);
+  process.exit(1);
 });
-
-// EVENTS
-app.post('/events', requireAuth, async (req, res) => {
-  const { platform, kind, payload, child_id } = req.body || {};
-  await sql(
-    `insert into usage_events(family_id, child_id, platform, kind, payload)
-     values($1,$2,$3,$4,$5)`,
-    [req.user.fid, child_id || null, platform, kind, payload || {}]
-  );
-  res.json({ ok: true });
-});
-
-app.get('/policy', requireAuth, async (req, res) => {
-  const platform = req.query.platform || 'youtube';
-  const { rows } = await sql(
-    `select daily_minutes, bedtime, whitelist from rules where family_id=$1 and platform=$2`,
-    [req.user.fid, platform]
-  );
-  res.json(rows[0] || { daily_minutes: 45, bedtime: '21:00', whitelist: [] });
-});
-
-app.listen(PORT, () => console.log(`Guardian backend running on port ${PORT}`));
