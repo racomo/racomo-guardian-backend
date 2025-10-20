@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Bloomly Dashboard</title>
+<style>
+body{font-family:system-ui;background:#f8faf8;padding:2rem;}
+input,button{padding:.6rem;margin:.3rem;}
+#log{white-space:pre;font-family:monospace;background:#fff;border:1px solid #ddd;padding:1rem;}
+</style>
+</head>
+<body>
+<h1>🌿 Bloomly Test Dashboard</h1>
+
+<label>Email <input id="email" value="parent@bloomly.io"></label><br>
+<label>Password <input id="pass" type="password" value="SafePass123!"></label><br>
+<button id="register">Register</button>
+<button id="login">Login</button>
+
+<h3>Output:</h3>
+<pre id="log"></pre>
+
+<script>
+const API = "https://bloomly-backend.onrender.com";
+const log = m => document.getElementById('log').textContent = JSON.stringify(m,null,2);
+
+async function request(path, body) {
+  const r = await fetch(API+path, {
+    method:"POST",
+    headers:{ "Content-Type":"application/json" },
+    body: JSON.stringify(body)
+  });
+  return r.json();
+}
+
+document.getElementById('register').onclick = async () => {
+  log(await request("/auth/register", {
+    email: document.getElementById('email').value,
+    password: document.getElementById('pass').value
+  }));
+};
+
+document.getElementById('login').onclick = async () => {
+  log(await request("/auth/login", {
+    email: document.getElementById('email').value,
+    password: document.getElementById('pass').value
+  }));
+};
+</script>
+</body>
+</html>
